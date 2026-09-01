@@ -1,0 +1,10 @@
+/openapitester
+/dist/
+/build/
+/coverage.out
+/*.test
+*.exe
+*.log
+report*.json
+report*.md
+openapitester-report.*
