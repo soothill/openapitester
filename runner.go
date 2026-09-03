@@ -145,6 +145,8 @@ func executeTarget(ctx context.Context, client *http.Client, cfg Config, target 
 	}
 
 	applyHeaders(req.Header, cfg.Headers)
+	applyQueryParams(req.URL, cfg.QueryParams)
+	applyOpenAPIAuth(req, cfg, target)
 	if cfg.UserAgent != "" && req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", cfg.UserAgent)
 	}
@@ -323,6 +325,8 @@ func (a *reportAggregator) Report(endedAt time.Time) *RunReport {
 			Rate:                  a.cfg.Rate,
 			Timeout:               a.cfg.Timeout,
 			ExpectedStatuses:      append([]string(nil), a.cfg.ExpectedStatuses...),
+			QueryParams:           sortedStringMapKeys(a.cfg.QueryParams),
+			AuthSchemes:           sortedStringMapKeys(a.cfg.AuthCredentials),
 			ProbeUndocumented:     a.cfg.ProbeUndocumented,
 			MaxSamples:            a.cfg.MaxSamples,
 			IncludeSuccessSamples: a.cfg.IncludeSuccessSamples,

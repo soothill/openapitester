@@ -14,6 +14,8 @@ type Config struct {
 	Methods               []string
 	Headers               http.Header
 	Parameters            map[string]string
+	QueryParams           map[string]string
+	AuthCredentials       map[string]string
 	ExpectedStatuses      []string
 	RequestBody           []byte
 	RequestContentType    string
@@ -34,17 +36,33 @@ type Config struct {
 }
 
 type Target struct {
-	ID                         string              `json:"id"`
-	Method                     string              `json:"method"`
-	URL                        string              `json:"url"`
-	Path                       string              `json:"path,omitempty"`
-	OperationID                string              `json:"operationId,omitempty"`
-	Source                     string              `json:"source"`
-	ExpectedStatuses           []string            `json:"expectedStatuses,omitempty"`
-	ExpectedContentTypesByCode map[string][]string `json:"expectedContentTypesByCode,omitempty"`
-	RequestContentType         string              `json:"requestContentType,omitempty"`
-	RequestBodyBytes           int                 `json:"requestBodyBytes,omitempty"`
-	RequestBody                []byte              `json:"-"`
+	ID                         string                    `json:"id"`
+	Method                     string                    `json:"method"`
+	URL                        string                    `json:"url"`
+	Path                       string                    `json:"path,omitempty"`
+	OperationID                string                    `json:"operationId,omitempty"`
+	Source                     string                    `json:"source"`
+	ExpectedStatuses           []string                  `json:"expectedStatuses,omitempty"`
+	ExpectedContentTypesByCode map[string][]string       `json:"expectedContentTypesByCode,omitempty"`
+	RequestContentType         string                    `json:"requestContentType,omitempty"`
+	RequestBodyBytes           int                       `json:"requestBodyBytes,omitempty"`
+	RequestBody                []byte                    `json:"-"`
+	SecurityRequirementSource  string                    `json:"securityRequirementSource,omitempty"`
+	SecurityRequirements       []SecurityRequirement     `json:"securityRequirements,omitempty"`
+	SecuritySchemes            map[string]SecurityScheme `json:"securitySchemes,omitempty"`
+}
+
+type SecurityRequirement struct {
+	SchemeNames []string `json:"schemeNames"`
+}
+
+type SecurityScheme struct {
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	In           string `json:"in,omitempty"`
+	ParamName    string `json:"paramName,omitempty"`
+	Scheme       string `json:"scheme,omitempty"`
+	BearerFormat string `json:"bearerFormat,omitempty"`
 }
 
 type Variance struct {
@@ -90,6 +108,8 @@ type ReportConfig struct {
 	Rate                  float64       `json:"rate"`
 	Timeout               time.Duration `json:"timeout"`
 	ExpectedStatuses      []string      `json:"expectedStatuses,omitempty"`
+	QueryParams           []string      `json:"queryParams,omitempty"`
+	AuthSchemes           []string      `json:"authSchemes,omitempty"`
 	ProbeUndocumented     bool          `json:"probeUndocumented"`
 	MaxSamples            int           `json:"maxSamples"`
 	IncludeSuccessSamples bool          `json:"includeSuccessSamples"`

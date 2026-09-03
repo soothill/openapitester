@@ -67,6 +67,13 @@ func discoverOpenAPITargets(ctx context.Context, cfg Config) ([]Target, error) {
 		return nil, err
 	}
 
+	securitySchemes := discoverSecuritySchemes(root)
+	if err := validateAuthCredentials(cfg.AuthCredentials, securitySchemes); err != nil {
+		return nil, err
+	}
+	rootSecurityRaw, hasRootSecurity := root["security"]
+	rootSecurity := parseSecurityRequirements(rootSecurityRaw)
+
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = firstServerURL(root, cfg.Parameters)
@@ -99,13 +106,21 @@ func discoverOpenAPITargets(ctx context.Context, cfg Config) ([]Target, error) {
 				if err != nil {
 					return nil, fmt.Errorf("%s %s: %w", method, pathName, err)
 				}
+				requirementSource := ""
+				if hasRootSecurity {
+					requirementSource = securitySourceRoot
+				}
+				targetSecuritySchemes := securitySchemesForTarget(securitySchemes, rootSecurity, requirementSource, cfg.AuthCredentials)
 				targets = append(targets, Target{
-					ID:               method + " " + pathName,
-					Method:           method,
-					URL:              targetURL,
-					Path:             pathName,
-					Source:           "openapi-undocumented",
-					ExpectedStatuses: append([]string(nil), cfg.ExpectedStatuses...),
+					ID:                        method + " " + pathName,
+					Method:                    method,
+					URL:                       targetURL,
+					Path:                      pathName,
+					Source:                    "openapi-undocumented",
+					ExpectedStatuses:          append([]string(nil), cfg.ExpectedStatuses...),
+					SecurityRequirementSource: requirementSource,
+					SecurityRequirements:      rootSecurity,
+					SecuritySchemes:           targetSecuritySchemes,
 				})
 				continue
 			}
@@ -133,6 +148,8 @@ func discoverOpenAPITargets(ctx context.Context, cfg Config) ([]Target, error) {
 			if operationID != "" {
 				targetID = operationID + " " + method + " " + pathName
 			}
+			requirements, requirementSource := targetSecurity(operation, rootSecurity, hasRootSecurity)
+			targetSecuritySchemes := securitySchemesForTarget(securitySchemes, requirements, requirementSource, cfg.AuthCredentials)
 
 			targets = append(targets, Target{
 				ID:                         targetID,
@@ -146,6 +163,9 @@ func discoverOpenAPITargets(ctx context.Context, cfg Config) ([]Target, error) {
 				RequestBody:                body,
 				RequestBodyBytes:           len(body),
 				RequestContentType:         contentType,
+				SecurityRequirementSource:  requirementSource,
+				SecurityRequirements:       requirements,
+				SecuritySchemes:            targetSecuritySchemes,
 			})
 		}
 	}

@@ -60,7 +60,9 @@ func main() {
 
 func parseConfig(args []string) (Config, error) {
 	var headers headerFlags
-	var params paramFlags
+	var params keyValueFlags
+	var queryParams keyValueFlags
+	var authCredentials keyValueFlags
 	var bodyFile string
 	var bodyText string
 	var methodsText string
@@ -85,6 +87,8 @@ func parseConfig(args []string) (Config, error) {
 	fs.Var(&headers, "H", "Request header, repeated. Example: -H 'Authorization: Bearer token'.")
 	fs.Var(&headers, "header", "Request header, repeated. Example: -header 'Accept: application/json'.")
 	fs.Var(&params, "param", "Path/query parameter value, repeated. Example: -param id=123.")
+	fs.Var(&queryParams, "query", "Query parameter appended to every request, repeated. Example: -query api_key=secret.")
+	fs.Var(&authCredentials, "auth", "OpenAPI security credential, repeated. Example: -auth ApiKeyAuth=secret.")
 	fs.StringVar(&expectedStatusText, "expect-status", "2XX,3XX", "Fallback accepted statuses, comma-separated. Supports 200, 2XX, 200-299, default.")
 	fs.StringVar(&bodyText, "body", "", "Request body to send when no spec body is generated.")
 	fs.StringVar(&bodyFile, "body-file", "", "File containing request body to send when no spec body is generated.")
@@ -113,6 +117,9 @@ func parseConfig(args []string) (Config, error) {
 	}
 	if cfg.URL != "" && cfg.SpecPath != "" {
 		return Config{}, errors.New("provide only one of -url or -spec; use -base-url with -spec")
+	}
+	if cfg.URL != "" && len(authCredentials) > 0 {
+		return Config{}, errors.New("-auth requires -spec because it uses OpenAPI security scheme names; use -H or -query with -url")
 	}
 	if cfg.Concurrency < 1 {
 		return Config{}, errors.New("-concurrency must be at least 1")
@@ -146,7 +153,18 @@ func parseConfig(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.Parameters = params.Map()
+	cfg.Parameters, err = params.Map()
+	if err != nil {
+		return Config{}, fmt.Errorf("-param: %w", err)
+	}
+	cfg.QueryParams, err = queryParams.Map()
+	if err != nil {
+		return Config{}, fmt.Errorf("-query: %w", err)
+	}
+	cfg.AuthCredentials, err = authCredentials.Map()
+	if err != nil {
+		return Config{}, fmt.Errorf("-auth: %w", err)
+	}
 
 	switch {
 	case bodyText != "" && bodyFile != "":
@@ -179,6 +197,7 @@ func printUsage(out *os.File) {
 	fmt.Fprintln(out, `Usage:
   openapitester -url https://api.example.com/widgets
   openapitester -spec openapi.yaml -base-url https://api.example.com -concurrency 20 -duration 1h -report report.md
+  openapitester -spec openapi.yaml -base-url https://api.example.com -auth ApiKeyAuth=$API_KEY
 
 The standard operation set is GET, PUT, POST, DELETE, OPTIONS, HEAD, PATCH, TRACE.`)
 }
@@ -211,27 +230,31 @@ func (h headerFlags) Header() (http.Header, error) {
 	return headers, nil
 }
 
-type paramFlags []string
+type keyValueFlags []string
 
-func (p *paramFlags) String() string {
+func (p *keyValueFlags) String() string {
 	return strings.Join(*p, ", ")
 }
 
-func (p *paramFlags) Set(value string) error {
+func (p *keyValueFlags) Set(value string) error {
 	if _, _, ok := strings.Cut(value, "="); !ok {
-		return fmt.Errorf("parameter %q must be in name=value form", value)
+		return fmt.Errorf("%q must be in name=value form", value)
 	}
 	*p = append(*p, value)
 	return nil
 }
 
-func (p paramFlags) Map() map[string]string {
+func (p keyValueFlags) Map() (map[string]string, error) {
 	values := make(map[string]string, len(p))
 	for _, item := range p {
 		name, value, _ := strings.Cut(item, "=")
-		values[strings.TrimSpace(name)] = strings.TrimSpace(value)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("%q has an empty name", item)
+		}
+		values[name] = strings.TrimSpace(value)
 	}
-	return values
+	return values, nil
 }
 
 func parseMethods(value string) ([]string, error) {

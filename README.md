@@ -14,6 +14,10 @@ The tool is designed for quick endpoint smoke checks, repeatable contract checks
 - Discovers documented operations from `paths`.
 - Optionally probes undocumented operations for every path with `-probe-undocumented`.
 - Replaces required path parameters and required query parameters using provided or generated sample values.
+- Reads OpenAPI `components.securitySchemes` and injects configured credentials with `-auth`.
+- Supports OpenAPI `apiKey` auth in headers, query parameters, and cookies.
+- Supports common HTTP auth schemes such as bearer and basic auth.
+- Supports explicit global query parameters with `-query`.
 - Generates simple request bodies from OpenAPI examples, named examples, or schemas.
 - Sends concurrent requests with a configurable worker count.
 - Runs for a fixed number of iterations or for an extended duration.
@@ -75,6 +79,7 @@ Use CI-friendly failure behavior:
 openapitester \
   -spec openapi.yaml \
   -base-url https://staging-api.example.com \
+  -auth BearerAuth="$API_TOKEN" \
   -fail-on-variance
 ```
 
@@ -92,6 +97,8 @@ For every response, the tool checks:
 - Whether an HTTP response was received at all.
 - Whether the status code matches the expected status patterns.
 - Whether the response `Content-Type` matches the documented OpenAPI response media type, when a media type is documented for the matching status.
+
+Authentication is applied at request time. Credentials passed with `-auth` and `-query` are not added to the stored target URL, so generated reports record the scheme or query parameter names without serializing the secret values. Secrets embedded directly in `-url` are part of the target URL and may appear in reports.
 
 The tool does not attempt to validate full response schemas yet. Its current focus is broad endpoint operation coverage, availability, documented status behavior, content type behavior, concurrency, and longer-run variance capture.
 
@@ -138,6 +145,14 @@ openapitester \
   -url https://api.example.com/widgets \
   -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/json"
+```
+
+Append a query parameter to every request:
+
+```sh
+openapitester \
+  -url https://api.example.com/widgets \
+  -query api_key="$API_KEY"
 ```
 
 Send a request body for body-capable methods:
@@ -189,6 +204,8 @@ When a spec is used, the tool:
 - Adds required query parameters with values from `-param` overrides or generated samples.
 - Uses OpenAPI operation `responses` as the expected response status set.
 - Uses documented response `content` media types for content-type comparison.
+- Uses operation-level `security` requirements, or root-level `security` requirements when an operation does not override them.
+- Injects credentials supplied with `-auth` according to `components.securitySchemes`.
 - Generates request bodies from media-type examples, named examples, or schemas when possible.
 
 Provide parameter values:
@@ -212,6 +229,136 @@ openapitester \
 ```
 
 Undocumented operation probes use fallback `-expect-status` patterns because the OpenAPI document does not provide operation-level responses for them.
+
+## Authentication
+
+There are three ways to pass security values to an endpoint:
+
+- `-H` sends an explicit request header.
+- `-query` appends an explicit query parameter to every request.
+- `-auth` maps a credential to an OpenAPI security scheme name and lets the tool inject it in the documented place.
+
+Use `-H` when you already know the header:
+
+```sh
+openapitester \
+  -url https://api.example.com/widgets \
+  -H "Authorization: Bearer $API_TOKEN"
+```
+
+Use `-query` for an arbitrary query-string key:
+
+```sh
+openapitester \
+  -url https://api.example.com/widgets \
+  -query api_key="$API_KEY"
+```
+
+Use `-auth` with OpenAPI specs:
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth ApiKeyAuth="$API_KEY"
+```
+
+`-auth` uses the security scheme name, not the actual header or query parameter name. For example, this OpenAPI security scheme:
+
+```yaml
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: query
+      name: api_key
+security:
+  - ApiKeyAuth: []
+```
+
+is invoked like this:
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth ApiKeyAuth="$API_KEY"
+```
+
+The request will include `?api_key=...`, but the report will only record that `ApiKeyAuth` was configured.
+
+Header API keys work the same way:
+
+```yaml
+components:
+  securitySchemes:
+    AdminKey:
+      type: apiKey
+      in: header
+      name: x-admin-key
+security:
+  - AdminKey: []
+```
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth AdminKey="$ADMIN_KEY"
+```
+
+Bearer tokens use HTTP security schemes:
+
+```yaml
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+security:
+  - BearerAuth: []
+```
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth BearerAuth="$API_TOKEN"
+```
+
+The tool sends `Authorization: Bearer ...`. If the credential already starts with `Bearer `, it is used as-is.
+
+Basic auth accepts a `username:password` value:
+
+```yaml
+components:
+  securitySchemes:
+    BasicAuth:
+      type: http
+      scheme: basic
+security:
+  - BasicAuth: []
+```
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth BasicAuth="user:password"
+```
+
+OAuth2 and OpenID Connect schemes are treated as bearer-token credentials:
+
+```sh
+openapitester \
+  -spec openapi.yaml \
+  -base-url https://api.example.com \
+  -auth OAuth2="$ACCESS_TOKEN"
+```
+
+When an OpenAPI operation offers multiple security alternatives, `openapitester` uses the first alternative for which all required `-auth` credentials were supplied. If the spec defines `components.securitySchemes` but does not attach root-level or operation-level `security` requirements, supplied `-auth` credentials for known schemes are applied to discovered targets. If an operation explicitly declares `security: []`, no OpenAPI-derived authentication is injected for that operation.
+
+Explicit `-H` values are applied before `-auth`; OpenAPI-derived auth does not overwrite an existing header. Explicit `-query` values are applied before query-based `-auth`; OpenAPI-derived query auth does not overwrite an existing query parameter.
 
 ## Request Body Generation
 
@@ -407,6 +554,8 @@ openapitester -url https://api.example.com/widgets -expect-status 200-299,304
 | `-methods` | `all` | Comma-separated operations to test, or `all`. |
 | `-H`, `-header` | none | Request header. Can be repeated. Example: `-H "Authorization: Bearer token"`. |
 | `-param` | none | Path/query/server parameter value. Can be repeated. Example: `-param id=123`. |
+| `-query` | none | Query parameter appended to every request. Can be repeated. Example: `-query api_key=secret`. |
+| `-auth` | none | OpenAPI security credential by security scheme name. Can be repeated. Example: `-auth ApiKeyAuth=secret`. Requires `-spec`. |
 | `-expect-status` | `2XX,3XX` | Fallback accepted statuses. Supports exact codes, classes, ranges, and `default`. |
 | `-body` | none | Request body to send when no spec body is generated. |
 | `-body-file` | none | File containing request body to send when no spec body is generated. |
@@ -471,7 +620,7 @@ Recommended practice:
 
 - OpenAPI 3.x is supported; Swagger/OpenAPI 2.0 is not a primary target.
 - Response body schema validation is not implemented yet.
-- Authentication is supplied through headers; OAuth or other auth flows are not automated.
+- OAuth, browser login, token refresh, and other interactive auth flows are not automated.
 - Request body generation is intentionally simple and may not satisfy business-specific validation.
 - Remote `$ref` resolution is not implemented; local document `$ref` pointers are supported.
 - Required headers and cookies from OpenAPI parameter definitions are not synthesized yet.
@@ -505,4 +654,4 @@ gofmt -w *.go
 
 ## Project Status
 
-This is an early multifunction utility. The first version focuses on endpoint operation coverage, concurrency, duration-based runs, and variance documentation. Good next additions would be response schema validation, richer auth helpers, per-operation data fixtures, and export formats for test management systems.
+This is an early multifunction utility. The first version focuses on endpoint operation coverage, concurrency, duration-based runs, authentication injection, and variance documentation. Good next additions would be response schema validation, per-operation data fixtures, and export formats for test management systems.
