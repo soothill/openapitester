@@ -33,6 +33,14 @@ type Config struct {
 	InsecureTLS           bool
 	ProbeUndocumented     bool
 	UserAgent             string
+	MaxResponseBytes      int64
+	OpenAI                bool
+	Model                 string
+	EmbeddingModel        string
+	Checks                string
+	APIToken              string
+	MaxTokens             int
+	TokenLimitField       string
 }
 
 type Target struct {
@@ -50,6 +58,9 @@ type Target struct {
 	SecurityRequirementSource  string                    `json:"securityRequirementSource,omitempty"`
 	SecurityRequirements       []SecurityRequirement     `json:"securityRequirements,omitempty"`
 	SecuritySchemes            map[string]SecurityScheme `json:"securitySchemes,omitempty"`
+	Check                      string                    `json:"check,omitempty"`
+	SkipReason                 string                    `json:"skipReason,omitempty"`
+	RequestedModel             string                    `json:"requestedModel,omitempty"`
 }
 
 type SecurityRequirement struct {
@@ -74,19 +85,22 @@ type Variance struct {
 }
 
 type Result struct {
-	TargetID       string     `json:"targetId"`
-	Method         string     `json:"method"`
-	URL            string     `json:"url"`
-	Path           string     `json:"path,omitempty"`
-	OperationID    string     `json:"operationId,omitempty"`
-	StartedAt      time.Time  `json:"startedAt"`
-	DurationMillis float64    `json:"durationMillis"`
-	StatusCode     int        `json:"statusCode,omitempty"`
-	Status         string     `json:"status,omitempty"`
-	ContentLength  int64      `json:"contentLength"`
-	ContentType    string     `json:"contentType,omitempty"`
-	Error          string     `json:"error,omitempty"`
-	Variances      []Variance `json:"variances,omitempty"`
+	TargetID         string     `json:"targetId"`
+	Method           string     `json:"method"`
+	URL              string     `json:"url"`
+	Path             string     `json:"path,omitempty"`
+	OperationID      string     `json:"operationId,omitempty"`
+	StartedAt        time.Time  `json:"startedAt"`
+	DurationMillis   float64    `json:"durationMillis"`
+	StatusCode       int        `json:"statusCode,omitempty"`
+	Status           string     `json:"status,omitempty"`
+	ContentLength    int64      `json:"contentLength"`
+	ContentType      string     `json:"contentType,omitempty"`
+	Error            string     `json:"error,omitempty"`
+	Variances        []Variance `json:"variances,omitempty"`
+	Outcome          string     `json:"outcome,omitempty"`
+	FirstTokenMillis float64    `json:"firstTokenMillis,omitempty"`
+	ReportedModel    string     `json:"reportedModel,omitempty"`
 }
 
 type RunReport struct {
@@ -113,6 +127,13 @@ type ReportConfig struct {
 	ProbeUndocumented     bool          `json:"probeUndocumented"`
 	MaxSamples            int           `json:"maxSamples"`
 	IncludeSuccessSamples bool          `json:"includeSuccessSamples"`
+	MaxResponseBytes      int64         `json:"maxResponseBytes"`
+	OpenAI                bool          `json:"openai"`
+	Model                 string        `json:"model,omitempty"`
+	EmbeddingModel        string        `json:"embeddingModel,omitempty"`
+	Checks                string        `json:"checks,omitempty"`
+	MaxTokens             int           `json:"maxTokens,omitempty"`
+	TokenLimitField       string        `json:"tokenLimitField,omitempty"`
 }
 
 type RunSummary struct {
@@ -120,6 +141,7 @@ type RunSummary struct {
 	EndedAt               time.Time      `json:"endedAt"`
 	DurationMillis        float64        `json:"durationMillis"`
 	TargetCount           int            `json:"targetCount"`
+	UntestedTargets       int            `json:"untestedTargets"`
 	TotalRequests         int            `json:"totalRequests"`
 	RequestsWithVariances int            `json:"requestsWithVariances"`
 	TotalVarianceItems    int            `json:"totalVarianceItems"`
@@ -143,4 +165,9 @@ type TargetSummary struct {
 	AvgLatencyMillis      float64        `json:"avgLatencyMillis,omitempty"`
 	MaxLatencyMillis      float64        `json:"maxLatencyMillis,omitempty"`
 	TotalLatencyMillis    float64        `json:"-"`
+	Check                 string         `json:"check,omitempty"`
+	SkipReason            string         `json:"skipReason,omitempty"`
+	OutcomeCounts         map[string]int `json:"outcomeCounts,omitempty"`
+	FirstVariance         *Result        `json:"firstVariance,omitempty"`
+	ReportedModels        map[string]int `json:"reportedModels,omitempty"`
 }

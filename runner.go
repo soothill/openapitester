@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -17,9 +19,25 @@ func runTargets(ctx context.Context, cfg Config, targets []Target) (*RunReport, 
 	}
 
 	startedAt := time.Now()
+	if cfg.Duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.Duration)
+		defer cancel()
+	}
 	client := newHTTPClient(cfg)
-	jobs := make(chan Target, cfg.Concurrency*2)
+	defer client.CloseIdleConnections()
+	jobs := make(chan Target)
 	results := make(chan Result, cfg.Concurrency*2)
+	var pace <-chan time.Time
+	if cfg.Rate > 0 {
+		interval := time.Duration(float64(time.Second) / cfg.Rate)
+		if interval < time.Nanosecond {
+			interval = time.Nanosecond
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		pace = ticker.C
+	}
 
 	var workers sync.WaitGroup
 	for workerID := 0; workerID < cfg.Concurrency; workerID++ {
@@ -27,6 +45,16 @@ func runTargets(ctx context.Context, cfg Config, targets []Target) (*RunReport, 
 		go func() {
 			defer workers.Done()
 			for target := range jobs {
+				if pace != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-pace:
+					}
+				}
+				if ctx.Err() != nil {
+					return
+				}
 				results <- executeTarget(ctx, client, cfg, target)
 			}
 		}()
@@ -62,52 +90,20 @@ func runTargets(ctx context.Context, cfg Config, targets []Target) (*RunReport, 
 }
 
 func produceJobs(ctx context.Context, cfg Config, targets []Target, jobs chan<- Target) {
-	waitForPace := paceFunc(cfg.Rate)
-	if cfg.Duration > 0 {
-		deadline := time.Now().Add(cfg.Duration)
-		index := 0
-		for time.Now().Before(deadline) {
-			if !waitForPace(ctx) {
-				return
-			}
-			if !sendJob(ctx, jobs, targets[index%len(targets)]) {
-				return
-			}
-			index++
+	runnable := make([]Target, 0, len(targets))
+	for _, target := range targets {
+		if target.SkipReason == "" {
+			runnable = append(runnable, target)
 		}
+	}
+	if len(runnable) == 0 {
 		return
 	}
-
-	for iteration := 0; iteration < cfg.Iterations; iteration++ {
-		for _, target := range targets {
-			if !waitForPace(ctx) {
-				return
-			}
+	for iteration := 0; cfg.Duration > 0 || iteration < cfg.Iterations; iteration++ {
+		for _, target := range runnable {
 			if !sendJob(ctx, jobs, target) {
 				return
 			}
-		}
-	}
-}
-
-func paceFunc(rate float64) func(context.Context) bool {
-	if rate <= 0 {
-		return func(ctx context.Context) bool {
-			return ctx.Err() == nil
-		}
-	}
-	interval := time.Duration(float64(time.Second) / rate)
-	if interval < time.Millisecond {
-		interval = time.Millisecond
-	}
-	ticker := time.NewTicker(interval)
-	return func(ctx context.Context) bool {
-		select {
-		case <-ctx.Done():
-			ticker.Stop()
-			return false
-		case <-ticker.C:
-			return true
 		}
 	}
 }
@@ -121,9 +117,9 @@ func sendJob(ctx context.Context, jobs chan<- Target, target Target) bool {
 	}
 }
 
-func executeTarget(ctx context.Context, client *http.Client, cfg Config, target Target) Result {
+func executeTarget(ctx context.Context, client *http.Client, cfg Config, target Target) (result Result) {
 	startedAt := time.Now()
-	result := Result{
+	result = Result{
 		TargetID:    target.ID,
 		Method:      target.Method,
 		URL:         target.URL,
@@ -131,6 +127,13 @@ func executeTarget(ctx context.Context, client *http.Client, cfg Config, target 
 		OperationID: target.OperationID,
 		StartedAt:   startedAt,
 	}
+	defer func() {
+		result.DurationMillis = millisSince(startedAt)
+		if target.Check != "" && result.Outcome == "" {
+			result.Outcome = "inconclusive"
+		}
+		redactResult(&result, cfg)
+	}()
 
 	var body io.Reader
 	if len(target.RequestBody) > 0 {
@@ -147,6 +150,9 @@ func executeTarget(ctx context.Context, client *http.Client, cfg Config, target 
 	applyHeaders(req.Header, cfg.Headers)
 	applyQueryParams(req.URL, cfg.QueryParams)
 	applyOpenAPIAuth(req, cfg, target)
+	if cfg.APIToken != "" {
+		setHeaderIfAbsent(req.Header, "Authorization", bearerHeaderValue(cfg.APIToken))
+	}
 	if cfg.UserAgent != "" && req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", cfg.UserAgent)
 	}
@@ -157,6 +163,10 @@ func executeTarget(ctx context.Context, client *http.Client, cfg Config, target 
 	resp, err := client.Do(req)
 	result.DurationMillis = millisSince(startedAt)
 	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
 		result.Error = err.Error()
 		result.Variances = []Variance{transportVariance(err)}
 		return result
@@ -166,8 +176,30 @@ func executeTarget(ctx context.Context, client *http.Client, cfg Config, target 
 	result.StatusCode = resp.StatusCode
 	result.Status = resp.Status
 	result.ContentType = resp.Header.Get("Content-Type")
-	result.ContentLength = drainBody(resp)
+	limit := cfg.MaxResponseBytes
+	if limit <= 0 {
+		limit = 4 << 20
+	}
+	var responseBody []byte
+	if target.Check != "" {
+		responseBody, err = readCompatibilityBody(resp, limit, startedAt, &result)
+		result.ContentLength = int64(len(responseBody))
+	} else {
+		result.ContentLength, err = io.Copy(io.Discard, io.LimitReader(resp.Body, limit+1))
+	}
 	result.Variances = evaluateVariances(target, result)
+	if err != nil {
+		result.Error = err.Error()
+		result.Variances = append(result.Variances, Variance{Type: "response_read_error", Severity: "error", Message: "response body could not be read completely", Actual: err.Error()})
+		return result
+	}
+	if result.ContentLength > limit {
+		result.Variances = append(result.Variances, Variance{Type: "response_too_large", Severity: "warning", Message: "response exceeded -max-response-bytes; body validation was not completed"})
+		return result
+	}
+	if target.Check != "" {
+		evaluateCompatibility(target, resp, responseBody, &result)
+	}
 	return result
 }
 
@@ -177,20 +209,6 @@ func applyHeaders(target http.Header, source http.Header) {
 			target.Add(key, value)
 		}
 	}
-}
-
-func drainBody(resp *http.Response) int64 {
-	if resp.Body == nil {
-		return 0
-	}
-	count, err := io.Copy(io.Discard, resp.Body)
-	if err != nil {
-		return count
-	}
-	if resp.ContentLength >= 0 && count == 0 {
-		return resp.ContentLength
-	}
-	return count
 }
 
 func transportVariance(err error) Variance {
@@ -227,6 +245,10 @@ func newReportAggregator(cfg Config, targets []Target, startedAt time.Time) *rep
 			OperationID:    target.OperationID,
 			StatusCounts:   make(map[string]int),
 			VarianceCounts: make(map[string]int),
+			Check:          target.Check,
+			SkipReason:     target.SkipReason,
+			OutcomeCounts:  make(map[string]int),
+			ReportedModels: make(map[string]int),
 		}
 		summaries = append(summaries, summary)
 		byTarget[target.ID] = &summaries[len(summaries)-1]
@@ -264,12 +286,22 @@ func (a *reportAggregator) Add(result Result) {
 	targetSummary := a.byTarget[result.TargetID]
 	if targetSummary != nil {
 		targetSummary.Requests++
+		if result.ReportedModel != "" {
+			targetSummary.ReportedModels[result.ReportedModel]++
+		}
+		if result.Outcome != "" {
+			targetSummary.OutcomeCounts[result.Outcome]++
+		}
 		targetSummary.StatusCounts[statusKey]++
 		if result.Error != "" {
 			targetSummary.TransportErrors++
 		}
 		if len(result.Variances) > 0 {
 			targetSummary.RequestsWithVariances++
+			if targetSummary.FirstVariance == nil {
+				copy := result
+				targetSummary.FirstVariance = &copy
+			}
 		}
 		for _, variance := range result.Variances {
 			targetSummary.VarianceCounts[variance.Type]++
@@ -304,11 +336,15 @@ func (a *reportAggregator) PrintProgress(out *os.File, elapsed time.Duration) {
 }
 
 func (a *reportAggregator) Report(endedAt time.Time) *RunReport {
+	a.summary.UntestedTargets = 0
 	a.summary.EndedAt = endedAt
 	a.summary.DurationMillis = float64(endedAt.Sub(a.startedAt).Microseconds()) / 1000
 	targetSummaries := make([]TargetSummary, 0, len(a.targets))
 	for _, target := range a.targets {
 		if summary := a.byTarget[target.ID]; summary != nil {
+			if summary.Requests == 0 && target.SkipReason == "" {
+				a.summary.UntestedTargets++
+			}
 			targetSummaries = append(targetSummaries, *summary)
 		}
 	}
@@ -330,6 +366,13 @@ func (a *reportAggregator) Report(endedAt time.Time) *RunReport {
 			ProbeUndocumented:     a.cfg.ProbeUndocumented,
 			MaxSamples:            a.cfg.MaxSamples,
 			IncludeSuccessSamples: a.cfg.IncludeSuccessSamples,
+			MaxResponseBytes:      a.cfg.MaxResponseBytes,
+			OpenAI:                a.cfg.OpenAI,
+			Model:                 a.cfg.Model,
+			EmbeddingModel:        a.cfg.EmbeddingModel,
+			Checks:                a.cfg.Checks,
+			MaxTokens:             a.cfg.MaxTokens,
+			TokenLimitField:       a.cfg.TokenLimitField,
 		},
 		Targets:        a.targets,
 		Summary:        a.summary,

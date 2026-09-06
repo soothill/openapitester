@@ -12,7 +12,11 @@ import (
 )
 
 func writeConsoleReport(out io.Writer, report *RunReport) error {
-	fmt.Fprintln(out, "OpenAPI endpoint test report")
+	if report.Config.OpenAI {
+		fmt.Fprintln(out, "OpenAI API compatibility report")
+	} else {
+		fmt.Fprintln(out, "OpenAPI endpoint test report")
+	}
 	fmt.Fprintf(out, "Targets: %d  Requests: %d  Variance requests: %d  Transport errors: %d  Elapsed: %s\n",
 		report.Summary.TargetCount,
 		report.Summary.TotalRequests,
@@ -20,6 +24,23 @@ func writeConsoleReport(out io.Writer, report *RunReport) error {
 		report.Summary.TransportErrors,
 		durationFromMillis(report.Summary.DurationMillis),
 	)
+	if report.Summary.UntestedTargets > 0 {
+		fmt.Fprintf(out, "Selected targets not tested: %d\n", report.Summary.UntestedTargets)
+	}
+	if report.Config.OpenAI {
+		fmt.Fprintln(out, "\nCompatibility checks (observed behavior, not certification):")
+		for _, target := range report.TargetsSummary {
+			fmt.Fprintf(out, "  %-18s %-35s requests=%d\n", target.Check, compatibilitySummary(target), target.Requests)
+			if len(target.ReportedModels) > 0 {
+				fmt.Fprintf(out, "    reported_models=%s\n", formatCounts(target.ReportedModels))
+			}
+			if target.FirstVariance != nil {
+				for _, issue := range target.FirstVariance.Variances {
+					fmt.Fprintf(out, "    [%s] %s %s\n", issue.Type, issue.Message, issue.Actual)
+				}
+			}
+		}
+	}
 
 	if len(report.Summary.VarianceCounts) > 0 {
 		fmt.Fprintln(out, "\nVariance counts:")
@@ -95,15 +116,39 @@ func normalizeReportFormat(path string, format string) string {
 
 func markdownReport(report *RunReport) string {
 	var b strings.Builder
-	fmt.Fprintln(&b, "# OpenAPI Endpoint Test Report")
+	if report.Config.OpenAI {
+		fmt.Fprintln(&b, "# OpenAI API Compatibility Report")
+	} else {
+		fmt.Fprintln(&b, "# OpenAPI Endpoint Test Report")
+	}
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "- Started: `%s`\n", report.Summary.StartedAt.Format(time.RFC3339))
 	fmt.Fprintf(&b, "- Ended: `%s`\n", report.Summary.EndedAt.Format(time.RFC3339))
 	fmt.Fprintf(&b, "- Elapsed: `%s`\n", durationFromMillis(report.Summary.DurationMillis))
 	fmt.Fprintf(&b, "- Targets: `%d`\n", report.Summary.TargetCount)
 	fmt.Fprintf(&b, "- Requests: `%d`\n", report.Summary.TotalRequests)
+	fmt.Fprintf(&b, "- Selected targets not tested: `%d`\n", report.Summary.UntestedTargets)
 	fmt.Fprintf(&b, "- Requests with variances: `%d`\n", report.Summary.RequestsWithVariances)
 	fmt.Fprintf(&b, "- Transport errors: `%d`\n", report.Summary.TransportErrors)
+	if report.Config.OpenAI {
+		fmt.Fprintf(&b, "- Chat model: `%s`\n", escapeMarkdownTable(report.Config.Model))
+		fmt.Fprintf(&b, "- Token budget: `%d` (`%s`)\n", report.Config.MaxTokens, report.Config.TokenLimitField)
+		fmt.Fprint(&b, "\n## Compatibility Checks\n\nResults describe observed behavior for these requests, models, and credentials. Skipped or untested checks establish no compatibility.\n\n")
+		fmt.Fprintln(&b, "| Check | Outcomes | Requests | Reported Models |")
+		fmt.Fprintln(&b, "| --- | --- | ---: | --- |")
+		for _, target := range report.TargetsSummary {
+			fmt.Fprintf(&b, "| %s | %s | %d | %s |\n", escapeMarkdownTable(target.Check), escapeMarkdownTable(compatibilitySummary(target)), target.Requests, escapeMarkdownTable(formatCounts(target.ReportedModels)))
+		}
+		fmt.Fprintln(&b, "\n### First Variance Per Check")
+		for _, target := range report.TargetsSummary {
+			if target.FirstVariance == nil {
+				continue
+			}
+			for _, issue := range target.FirstVariance.Variances {
+				fmt.Fprintf(&b, "\n- `%s` / `%s`: %s %s\n", target.Check, issue.Type, escapeMarkdownTable(issue.Message), escapeMarkdownTable(issue.Actual))
+			}
+		}
+	}
 
 	if len(report.Summary.VarianceCounts) > 0 {
 		fmt.Fprintln(&b)
@@ -202,5 +247,15 @@ func shorten(value string, max int) string {
 }
 
 func escapeMarkdownTable(value string) string {
-	return strings.ReplaceAll(value, "|", "\\|")
+	return strings.NewReplacer("|", "\\|", "\n", " ", "\r", " ", "`", "'").Replace(value)
+}
+
+func compatibilitySummary(target TargetSummary) string {
+	if target.SkipReason != "" {
+		return "skipped: " + target.SkipReason
+	}
+	if target.Requests == 0 {
+		return "not tested"
+	}
+	return formatCounts(target.OutcomeCounts)
 }

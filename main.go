@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -53,7 +54,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "wrote report: %s\n", cfg.ReportPath)
 	}
 
-	if cfg.FailOnVariance && (report.Summary.RequestsWithVariances > 0 || report.Summary.TransportErrors > 0) {
+	if cfg.FailOnVariance && (report.Summary.RequestsWithVariances > 0 || report.Summary.TransportErrors > 0 || report.Summary.UntestedTargets > 0) {
 		os.Exit(2)
 	}
 }
@@ -67,6 +68,7 @@ func parseConfig(args []string) (Config, error) {
 	var bodyText string
 	var methodsText string
 	var expectedStatusText string
+	var apiKeyEnv string
 
 	cfg := Config{
 		Concurrency:      4,
@@ -76,6 +78,9 @@ func parseConfig(args []string) (Config, error) {
 		ReportFormat:     "auto",
 		MaxSamples:       1000,
 		UserAgent:        "openapitester/0.1",
+		MaxResponseBytes: 4 << 20,
+		MaxTokens:        256,
+		TokenLimitField:  "max_completion_tokens",
 	}
 
 	fs := flag.NewFlagSet("openapitester", flag.ContinueOnError)
@@ -83,6 +88,13 @@ func parseConfig(args []string) (Config, error) {
 	fs.StringVar(&cfg.URL, "url", "", "Single endpoint URL to probe.")
 	fs.StringVar(&cfg.SpecPath, "spec", "", "OpenAPI 3.x JSON or YAML file/URL to exercise.")
 	fs.StringVar(&cfg.BaseURL, "base-url", "", "Base URL override for OpenAPI specs.")
+	fs.BoolVar(&cfg.OpenAI, "openai", false, "Run the OpenAI-compatible API conformance suite; requires -base-url and -model.")
+	fs.StringVar(&cfg.Model, "model", "", "Provider's chat model ID for the compatibility suite.")
+	fs.StringVar(&cfg.EmbeddingModel, "embedding-model", "", "Embedding model ID; embeddings are skipped when omitted.")
+	fs.StringVar(&cfg.Checks, "checks", "all", "Compatibility checks: all or comma-separated check names.")
+	fs.StringVar(&apiKeyEnv, "api-key-env", "", "Environment variable containing the bearer API key (OpenAI mode).")
+	fs.IntVar(&cfg.MaxTokens, "max-tokens", cfg.MaxTokens, "Output token budget for compatibility generation requests.")
+	fs.StringVar(&cfg.TokenLimitField, "token-limit-field", cfg.TokenLimitField, "Chat token budget field: max_completion_tokens or max_tokens.")
 	fs.StringVar(&methodsText, "methods", "all", "Comma-separated operations to test, or all.")
 	fs.Var(&headers, "H", "Request header, repeated. Example: -H 'Authorization: Bearer token'.")
 	fs.Var(&headers, "header", "Request header, repeated. Example: -header 'Accept: application/json'.")
@@ -102,6 +114,7 @@ func parseConfig(args []string) (Config, error) {
 	fs.StringVar(&cfg.ReportPath, "report", "", "Write a JSON or Markdown report to this path.")
 	fs.StringVar(&cfg.ReportFormat, "report-format", cfg.ReportFormat, "Report format: auto, json, markdown, md.")
 	fs.IntVar(&cfg.MaxSamples, "max-samples", cfg.MaxSamples, "Maximum sampled request results retained in the report.")
+	fs.Int64Var(&cfg.MaxResponseBytes, "max-response-bytes", cfg.MaxResponseBytes, "Maximum response bytes read per request; oversized bodies are reported as variances.")
 	fs.BoolVar(&cfg.IncludeSuccessSamples, "include-success-samples", false, "Include successful request samples, not only variances.")
 	fs.BoolVar(&cfg.FailOnVariance, "fail-on-variance", false, "Exit with code 2 when variances are found.")
 	fs.BoolVar(&cfg.InsecureTLS, "insecure", false, "Skip TLS certificate verification.")
@@ -111,9 +124,34 @@ func parseConfig(args []string) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	if fs.NArg() != 0 {
+		return Config{}, errors.New("unexpected positional arguments")
+	}
 
-	if cfg.URL == "" && cfg.SpecPath == "" {
-		return Config{}, errors.New("provide either -url or -spec")
+	if cfg.OpenAI {
+		if cfg.URL != "" || cfg.SpecPath != "" || cfg.BaseURL == "" || cfg.Model == "" {
+			return Config{}, errors.New("-openai requires -base-url and -model and cannot be combined with -url or -spec")
+		}
+		if len(authCredentials) > 0 || bodyText != "" || bodyFile != "" || methodsText != "all" || cfg.ProbeUndocumented {
+			return Config{}, errors.New("-openai uses predefined requests; use -H, -query or -api-key-env for authentication, and -checks for selection")
+		}
+	} else if cfg.URL == "" && cfg.SpecPath == "" {
+		return Config{}, errors.New("provide -url, -spec, or -openai with -base-url and -model")
+	}
+	if !cfg.OpenAI && (cfg.Model != "" || cfg.EmbeddingModel != "" || apiKeyEnv != "" || cfg.Checks != "all") {
+		return Config{}, errors.New("model, checks, and api-key-env options require -openai")
+	}
+	if cfg.MaxTokens < 1 {
+		return Config{}, errors.New("-max-tokens must be positive")
+	}
+	if cfg.TokenLimitField != "max_tokens" && cfg.TokenLimitField != "max_completion_tokens" {
+		return Config{}, errors.New("-token-limit-field must be max_tokens or max_completion_tokens")
+	}
+	if apiKeyEnv != "" {
+		cfg.APIToken = strings.TrimSpace(os.Getenv(apiKeyEnv))
+		if cfg.APIToken == "" {
+			return Config{}, errors.New("the environment variable named by -api-key-env is empty or unset")
+		}
 	}
 	if cfg.URL != "" && cfg.SpecPath != "" {
 		return Config{}, errors.New("provide only one of -url or -spec; use -base-url with -spec")
@@ -127,8 +165,20 @@ func parseConfig(args []string) (Config, error) {
 	if cfg.Iterations < 1 {
 		return Config{}, errors.New("-iterations must be at least 1")
 	}
-	if cfg.Rate < 0 {
+	if cfg.Rate < 0 || math.IsNaN(cfg.Rate) || math.IsInf(cfg.Rate, 0) {
 		return Config{}, errors.New("-rate must be zero or greater")
+	}
+	if cfg.Rate > 0 && float64(time.Second)/cfg.Rate >= float64(math.MaxInt64) {
+		return Config{}, errors.New("-rate is too small to represent as a pacing interval")
+	}
+	if cfg.Duration < 0 || cfg.ProgressInterval < 0 {
+		return Config{}, errors.New("-duration and -progress must be zero or greater")
+	}
+	if cfg.MaxResponseBytes < 1 || cfg.MaxResponseBytes == math.MaxInt64 {
+		return Config{}, errors.New("-max-response-bytes must be positive and less than the maximum int64")
+	}
+	if format := normalizeReportFormat(cfg.ReportPath, cfg.ReportFormat); format != "json" && format != "markdown" {
+		return Config{}, errors.New("-report-format must be auto, json, markdown, or md")
 	}
 	if cfg.Timeout <= 0 {
 		return Config{}, errors.New("-timeout must be greater than zero")
@@ -188,8 +238,9 @@ func newHTTPClient(cfg Config) *http.Client {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	return &http.Client{
-		Timeout:   cfg.Timeout,
-		Transport: transport,
+		Timeout:       cfg.Timeout,
+		Transport:     transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }
 
@@ -198,6 +249,7 @@ func printUsage(out *os.File) {
   openapitester -url https://api.example.com/widgets
   openapitester -spec openapi.yaml -base-url https://api.example.com -concurrency 20 -duration 1h -report report.md
   openapitester -spec openapi.yaml -base-url https://api.example.com -auth ApiKeyAuth=$API_KEY
+  openapitester -openai -base-url https://provider.example/v1 -model provider-model -api-key-env API_KEY -report compatibility.md
 
 The standard operation set is GET, PUT, POST, DELETE, OPTIONS, HEAD, PATCH, TRACE.`)
 }

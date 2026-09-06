@@ -18,6 +18,9 @@ import (
 var pathParameterPattern = regexp.MustCompile(`\{([^}/]+)\}`)
 
 func discoverTargets(ctx context.Context, cfg Config) ([]Target, error) {
+	if cfg.OpenAI {
+		return discoverCompatibilityTargets(cfg)
+	}
 	if cfg.URL != "" {
 		return discoverSingleURLTargets(cfg), nil
 	}
